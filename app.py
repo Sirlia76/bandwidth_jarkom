@@ -19,10 +19,15 @@ import inspect
 # Kalau gagal, dashboard tetap bisa jalan dengan mode simulasi.
 try:
     from puresnmp import get as snmp_get
+    try:
+        from puresnmp import Client as SNMPClient, V2C as SNMPV2C
+    except Exception:
+        SNMPClient, SNMPV2C = None, None
     SNMP_AVAILABLE = True
     SNMP_ERROR_MESSAGE = ""
 except Exception as e:
     snmp_get = None
+    SNMPClient, SNMPV2C = None, None
     SNMP_AVAILABLE = False
     SNMP_ERROR_MESSAGE = str(e)
 
@@ -111,7 +116,7 @@ st.markdown(
     }
 
     h1, h2, h3, .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
-        color: #0f3b70 !important;
+        color: #000000 !important;
         font-weight: 900 !important;
     }
 
@@ -228,22 +233,39 @@ data["Kategori_Bandwidth"] = data["Cluster"].map(label_cluster)
 # HELPER FUNCTIONS
 # =========================================================
 def classify_activity(download_ratio, upload_ratio, latency, jitter, packet_loss):
-    if download_ratio > 0.78:
-        return "Download"
-    if download_ratio > 0.60 and latency < 100 and jitter < 45:
-        return "Streaming"
-    if upload_ratio > 0.40 and latency < 140 and jitter < 55:
-        return "Video Meeting"
-    if latency < 65 and jitter < 28 and packet_loss < 1.8:
-        return "Gaming"
-    return "Browsing"
+    """Klasifikasi aktivitas yang lebih realistis.
 
+    Catatan:
+    Fungsi ini tetap memakai rasio agar kompatibel dengan dataset lama.
+    Untuk data SNMP real, koreksi tambahan dilakukan di generate_realtime_row()
+    berdasarkan nilai Mbps asli supaya trafik kecil tidak salah terbaca Gaming.
+    """
+    download_ratio = float(download_ratio)
+    upload_ratio = float(upload_ratio)
+    total_ratio = download_ratio + upload_ratio
+
+    if total_ratio < 0.05:
+        return "Browsing"
+
+    if download_ratio > 0.70 and total_ratio >= 0.10:
+        return "Download"
+
+    if download_ratio > 0.45 and latency < 120 and jitter < 35 and packet_loss < 2:
+        return "Streaming"
+
+    if upload_ratio > 0.30 and latency < 150 and jitter < 45 and packet_loss < 2.5:
+        return "Video Meeting"
+
+    if latency < 60 and jitter < 15 and packet_loss < 1.0 and total_ratio >= 0.12:
+        return "Gaming"
+
+    return "Browsing"
 
 def health_score(latency, jitter, packet_loss, usage_ratio):
     nilai = 100
-    nilai -= min(latency / 3.0, 35)
-    nilai -= min(jitter / 2.0, 25)
-    nilai -= min(packet_loss * 8.0, 25)
+    nilai -= min(latency / 6.0, 20)
+    nilai -= min(jitter / 4.0, 15)
+    nilai -= min(packet_loss * 5.0, 20)
     nilai -= min(usage_ratio * 15.0, 15)
     return int(max(0, min(100, nilai)))
 
@@ -291,18 +313,43 @@ def recommendation(status, mood, activity, latency, jitter, packet_loss, usage_r
 def ai_insight(df):
     if df.empty:
         return "Belum ada data monitoring."
+
     temp = df.copy()
     if "Jam" not in temp.columns:
         temp["Jam"] = pd.to_datetime(temp["Waktu"], errors="coerce").dt.hour.fillna(0).astype(int)
-    value_col = "Throughput" if "Throughput" in temp.columns else "actual_bandwidth"
-    busy_hour = int(temp.groupby("Jam")[value_col].mean().idxmax())
+
     dominant = temp["Aktivitas"].mode()[0] if "Aktivitas" in temp.columns and not temp["Aktivitas"].mode().empty else "Belum terdeteksi"
     avg_latency = temp["Latency"].mean() if "Latency" in temp.columns else temp.get("rtt", pd.Series([0])).mean()
     avg_loss = temp["Packet Loss"].mean() if "Packet Loss" in temp.columns else temp.get("packet_loss_ratio", pd.Series([0])).mean()
     avg_jitter = temp["Jitter"].mean() if "Jitter" in temp.columns else temp.get("jitter", pd.Series([0])).mean()
-    kondisi = "cukup stabil" if avg_latency < 100 and avg_loss < 2 and avg_jitter < 40 else "perlu perhatian"
-    return f"Jam tersibuk sekitar pukul {busy_hour}:00. Aktivitas dominan adalah {dominant}. Kondisi jaringan {kondisi}."
+    avg_throughput = temp["Throughput"].mean() if "Throughput" in temp.columns else temp.get("actual_bandwidth", pd.Series([0])).mean()
 
+    if avg_latency < 80 and avg_loss < 1.5 and avg_jitter < 25:
+        kondisi = "cukup stabil"
+    elif avg_latency < 140 and avg_loss < 3 and avg_jitter < 50:
+        kondisi = "cukup padat, tetapi masih bisa digunakan"
+    else:
+        kondisi = "perlu perhatian"
+
+    # Jangan menyimpulkan jam tersibuk kalau data masih sedikit
+    # atau semua data masih berada pada jam yang sama.
+    if len(temp) < 20:
+        return (
+            f"Data monitoring masih sedikit ({len(temp)} sampel). "
+            f"Belum cukup untuk menentukan pola penggunaan jaringan. "
+            f"Throughput rata-rata {format_speed(avg_throughput)}."
+        )
+
+    if temp["Jam"].nunique() < 2:
+        return (
+            f"Data monitoring sudah memiliki {len(temp)} sampel, tetapi masih berada pada jam yang sama. "
+            f"Aktivitas dominan adalah {dominant}. "
+            f"Throughput rata-rata {format_speed(avg_throughput)} dan kondisi jaringan {kondisi}."
+        )
+
+    value_col = "Throughput" if "Throughput" in temp.columns else "actual_bandwidth"
+    busy_hour = int(temp.groupby("Jam")[value_col].mean().idxmax())
+    return f"Jam dengan penggunaan tertinggi pada data saat ini sekitar pukul {busy_hour}:00. Aktivitas dominan adalah {dominant}. Kondisi jaringan {kondisi}."
 
 def historical_dashboard_data(n=100):
     hist = data.tail(n).copy().reset_index(drop=True)
@@ -326,29 +373,90 @@ def historical_dashboard_data(n=100):
     return df
 
 
-def generate_realtime_row(download=None, upload=None, source="Simulasi"):
+def generate_realtime_row(download=None, upload=None, source="Simulasi", latency=None, jitter=None, packet_loss=None):
+    """Buat 1 baris data monitoring.
+
+    Untuk mode SNMP, nilai download/upload berasal dari counter MikroTik.
+    Latency, jitter, dan packet loss TIDAK dibuat random ekstrem lagi agar
+    status jaringan tidak selalu Overload saat trafik kecil.
+    """
     max_bw = max(data["actual_bandwidth"].quantile(0.95), 1)
-    download = float(download if download is not None else np.random.uniform(0.15, 0.95) * max_bw)
-    upload = float(upload if upload is not None else np.random.uniform(0.05, 0.45) * max_bw)
-    latency = float(np.random.uniform(25, 185))
-    jitter = float(np.random.uniform(5, 85))
-    packet_loss = float(np.random.uniform(0, 6))
+
+    if source == "Simulasi":
+        download = float(download if download is not None else np.random.uniform(0.15, 0.95) * max_bw)
+        upload = float(upload if upload is not None else np.random.uniform(0.05, 0.45) * max_bw)
+        latency = float(latency if latency is not None else np.random.uniform(25, 120))
+        jitter = float(jitter if jitter is not None else np.random.uniform(3, 35))
+        packet_loss = float(packet_loss if packet_loss is not None else np.random.uniform(0, 2.5))
+    else:
+        # SNMP real: download/upload sudah dalam Mbps.
+        download = float(download or 0.0)
+        upload = float(upload or 0.0)
+        throughput_now = download + upload
+
+        # Estimasi QoS ringan supaya AI/status tidak ngawur.
+        # Ini bukan data SNMP; ini indikator turunan untuk dashboard.
+        latency = float(latency if latency is not None else 25 + min(throughput_now * 1.8, 60))
+        jitter = float(jitter if jitter is not None else 3 + min(throughput_now * 0.9, 25))
+        packet_loss = float(packet_loss if packet_loss is not None else min(max(throughput_now - 10, 0) * 0.04, 2.0))
+
     usage_ratio = min(1.0, (download + upload) / (max_bw * 1.3))
     activity = classify_activity(download / max_bw, upload / max_bw, latency, jitter, packet_loss)
+
+    # Koreksi khusus data SNMP real berdasarkan Mbps asli.
+    # Ini mencegah trafik kecil/idle salah diklasifikasikan sebagai Gaming.
+    if source != "Simulasi":
+        throughput_now = float(download + upload)
+
+        if throughput_now <= 0.0001:  # <= 100 bps: benar-benar hampir tidak ada trafik
+            activity = "Idle"
+        elif throughput_now < 0.03:  # 0.1-30 Kbps: trafik kecil seperti browsing ringan/background
+            activity = "Browsing"
+        elif throughput_now < 0.50 and latency < 80 and jitter < 15 and packet_loss < 1:
+            # Game online seperti Roblox sering memakai bandwidth kecil,
+            # tetapi stabil dan latency rendah.
+            activity = "Gaming"
+        elif upload > 0.5 and upload >= download * 0.8:
+            activity = "Video Meeting"
+        elif download > 1.0 and download >= upload * 3:
+            activity = "Streaming"
+        elif throughput_now >= 1.0 and latency < 60 and jitter < 15 and packet_loss < 1:
+            activity = "Gaming"
+        elif download > 2.0 and download >= upload * 2:
+            activity = "Download"
+        else:
+            activity = "Browsing"
+
+    throughput_now = float(download + upload)
+
+    # Klasifikasi AI real-time memakai model K-Means yang sudah dilatih dari dataset.
+    # Inputnya disesuaikan dengan fitur training: throughput, jitter, actual_bandwidth.
+    try:
+        sample_ai = pd.DataFrame(
+            [[throughput_now, float(jitter), float(download)]],
+            columns=fitur
+        )
+        cluster_ai = kmeans.predict(scaler.transform(sample_ai))[0]
+        kategori_ai = label_cluster.get(cluster_ai, "Tidak diketahui")
+    except Exception:
+        kategori_ai = "Tidak diketahui"
+
     hscore = health_score(latency, jitter, packet_loss, usage_ratio)
     status = network_status(hscore, usage_ratio)
     mood = network_mood(latency, jitter, packet_loss, usage_ratio)
     rec = recommendation(status, mood, activity, latency, jitter, packet_loss, usage_ratio)
+
     return {
         "Waktu": datetime.now(),
         "Jam": datetime.now().hour,
-        "Download": round(download, 2),
-        "Upload": round(upload, 2),
-        "Throughput": round(download + upload, 2),
+        "Download": float(download),
+        "Upload": float(upload),
+        "Throughput": throughput_now,
         "Latency": round(latency, 2),
         "Jitter": round(jitter, 2),
         "Packet Loss": round(packet_loss, 2),
         "Usage": round(usage_ratio * 100, 2),
+        "Kategori AI": kategori_ai,
         "Health Score": hscore,
         "Status": status,
         "Mood": mood,
@@ -356,7 +464,6 @@ def generate_realtime_row(download=None, upload=None, source="Simulasi"):
         "Rekomendasi": rec,
         "Sumber": source,
     }
-
 
 def _normalize_snmp_value(result):
     """Ubah hasil SNMP dari puresnmp menjadi integer."""
@@ -380,22 +487,38 @@ def _run_async(coro):
 
 
 def snmp_get_value(host, community, oid, port=161, timeout=2, retries=1):
-    """Ambil 1 nilai SNMP dari MikroTik menggunakan puresnmp."""
-    if not SNMP_AVAILABLE or snmp_get is None:
+    """Ambil 1 nilai SNMP dari MikroTik. Kompatibel untuk beberapa versi puresnmp."""
+    if not SNMP_AVAILABLE:
         return None, f"Library puresnmp belum siap: {SNMP_ERROR_MESSAGE}"
 
-    try:
+    errors = []
+
+    # Cara 1: puresnmp.get(host, community, oid) untuk puresnmp versi lama.
+    if snmp_get is not None:
+        for call in (
+            lambda: snmp_get(host, community, oid, port=int(port), timeout=timeout),
+            lambda: snmp_get(host, community, oid),
+        ):
+            try:
+                result = call()
+                if inspect.isawaitable(result):
+                    result = _run_async(result)
+                return _normalize_snmp_value(result), None
+            except Exception as e:
+                errors.append(str(e))
+
+    # Cara 2: fallback Client/V2C untuk puresnmp versi tertentu.
+    if SNMPClient is not None and SNMPV2C is not None:
         try:
-            result = snmp_get(host, community, oid, port=int(port), timeout=timeout)
-        except TypeError:
-            result = snmp_get(host, community, oid)
+            client = SNMPClient(host, SNMPV2C(community), port=int(port))
+            result = client.get(oid)
+            if inspect.isawaitable(result):
+                result = _run_async(result)
+            return _normalize_snmp_value(result), None
+        except Exception as e:
+            errors.append(str(e))
 
-        if inspect.isawaitable(result):
-            result = _run_async(result)
-
-        return _normalize_snmp_value(result), None
-    except Exception as e:
-        return None, str(e)
+    return None, " | ".join(errors) if errors else "Gagal membaca SNMP tanpa detail error."
 
 
 def get_snmp_octets(host, community, oid_in, oid_out, port):
@@ -410,6 +533,48 @@ def get_snmp_octets(host, community, oid_in, oid_out, port):
 
     return val_in, val_out, None
 
+
+def hitung_mbps(byte_now, byte_prev, interval_detik):
+    """Hitung Mbps dari selisih byte SNMP."""
+    if byte_now is None or byte_prev is None:
+        return 0.0
+    delta = max(0, int(byte_now) - int(byte_prev))
+    return (delta * 8) / max(float(interval_detik), 1.0) / 1_000_000
+
+
+def format_speed(mbps):
+    """Tampilkan speed adaptif supaya trafik kecil seperti ping tetap kelihatan."""
+    mbps = float(mbps)
+    if mbps >= 1:
+        return f"{mbps:,.2f} Mbps"
+    if mbps >= 0.001:
+        return f"{mbps * 1000:,.2f} Kbps"
+    return f"{mbps * 1_000_000:,.0f} bps"
+
+
+def recent_nonzero_or_avg(df, col, window=6):
+    """Ambil nilai terbaru yang tidak nol dari beberapa polling terakhir.
+    Kalau semua nol, pakai rata-rata window. Ini supaya tampilan tidak terlihat 0
+    hanya karena 1 interval polling kebetulan tidak ada paket lewat.
+    """
+    if df is None or df.empty or col not in df.columns:
+        return 0.0
+    recent = pd.to_numeric(df[col].tail(window), errors="coerce").fillna(0)
+    nonzero = recent[recent > 0]
+    if not nonzero.empty:
+        return float(nonzero.iloc[-1])
+    return float(recent.mean())
+
+
+def recent_activity_value(download, upload):
+    """Klasifikasi tampilan trafik agar tidak dianggap kosong saat ada nilai kecil."""
+    total = float(download) + float(upload)
+    if total < 0.005:
+        return "Idle"
+    if total < 0.50:
+        return "Browsing"
+    return None
+
 # =========================================================
 # SESSION STATE
 # =========================================================
@@ -421,6 +586,8 @@ if "prev_in" not in st.session_state:
     st.session_state.prev_in = None
 if "prev_out" not in st.session_state:
     st.session_state.prev_out = None
+if "prev_time" not in st.session_state:
+    st.session_state.prev_time = None
 if "polling_count" not in st.session_state:
     st.session_state.polling_count = 0
 
@@ -456,10 +623,14 @@ if menu == "Dashboard Utama":
     st.subheader("Dashboard Utama")
     latest = df_dash.iloc[-1]
 
+    display_download = recent_nonzero_or_avg(df_dash, "Download")
+    display_upload = recent_nonzero_or_avg(df_dash, "Upload")
+    display_throughput = max(recent_nonzero_or_avg(df_dash, "Throughput"), display_download + display_upload)
+
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Download", f"{df_dash['Download'].sum():,.0f} Mbps")
-    c2.metric("Total Upload", f"{df_dash['Upload'].sum():,.0f} Mbps")
-    c3.metric("Throughput", f"{latest['Throughput']:,.0f} Mbps")
+    c1.metric("Download Terbaru", format_speed(display_download))
+    c2.metric("Upload Terbaru", format_speed(display_upload))
+    c3.metric("Throughput", format_speed(display_throughput))
     c4.metric("Health Score", f"{int(latest['Health Score'])}/100")
 
     c5, c6, c7, c8 = st.columns(4)
@@ -467,6 +638,9 @@ if menu == "Dashboard Utama":
     c6.metric("Jitter", f"{latest['Jitter']:.2f} ms")
     c7.metric("Packet Loss", f"{latest['Packet Loss']:.2f}%")
     c8.metric("Status Jaringan", latest["Status"])
+
+    if "Kategori AI" in df_dash.columns:
+        st.metric("Kategori AI Bandwidth", latest.get("Kategori AI", "Tidak diketahui"))
 
     col_left, col_right = st.columns([1.4, 1])
     with col_left:
@@ -643,7 +817,29 @@ elif menu == "Monitoring Real-Time (SNMP)":
             "Community yang dipakai: public. Interface index 1 biasanya ether1, index 2 biasanya ether2."
         )
 
-    use_simulasi = st.checkbox("Gunakan Data Simulasi", value=not SNMP_AVAILABLE)
+        if st.button("🔎 Tes Baca SNMP Sekarang"):
+            test_in_1, test_out_1, test_err_1 = get_snmp_octets(snmp_host, snmp_community, oid_in, oid_out, snmp_port)
+            if test_err_1:
+                st.error(f"SNMP masih gagal: {test_err_1}")
+            else:
+                with st.spinner("SNMP berhasil membaca counter awal. Mengukur selisih 3 detik..."):
+                    time.sleep(3)
+                    test_in_2, test_out_2, test_err_2 = get_snmp_octets(snmp_host, snmp_community, oid_in, oid_out, snmp_port)
+
+                if test_err_2:
+                    st.error(f"SNMP counter awal terbaca, tapi counter kedua gagal: {test_err_2}")
+                else:
+                    test_download = hitung_mbps(test_in_2, test_in_1, 3)
+                    test_upload = hitung_mbps(test_out_2, test_out_1, 3)
+                    st.success("SNMP berhasil membaca counter MikroTik dan menghitung trafik.")
+                    t1, t2, t3, t4 = st.columns(4)
+                    t1.metric("Raw In Awal", f"{test_in_1:,}")
+                    t2.metric("Raw In Akhir", f"{test_in_2:,}")
+                    t3.metric("Download Terukur", format_speed(test_download))
+                    t4.metric("Upload Terukur", format_speed(test_upload))
+                    st.caption("Kalau speed kecil, itu normal saat trafik ringan. Untuk angka besar, jalankan aktivitas internet lewat laptop yang gateway-nya MikroTik.")
+
+    use_simulasi = st.checkbox("Gunakan Data Simulasi", value=False)
 
     c1, c2, c3 = st.columns(3)
     if c1.button("▶ Mulai Monitoring", disabled=st.session_state.monitoring_aktif):
@@ -651,6 +847,7 @@ elif menu == "Monitoring Real-Time (SNMP)":
         st.session_state.history_monitoring = []
         st.session_state.prev_in = None
         st.session_state.prev_out = None
+        st.session_state.prev_time = None
         st.session_state.polling_count = 0
         st.rerun()
 
@@ -660,6 +857,10 @@ elif menu == "Monitoring Real-Time (SNMP)":
 
     if c3.button("🧹 Hapus Riwayat"):
         st.session_state.history_monitoring = []
+        st.session_state.prev_in = None
+        st.session_state.prev_out = None
+        st.session_state.prev_time = None
+        st.session_state.polling_count = 0
         st.rerun()
 
     if st.session_state.monitoring_aktif:
@@ -677,15 +878,42 @@ elif menu == "Monitoring Real-Time (SNMP)":
                     "OID sesuai nomor interface, dan komputer (192.168.88.2) bisa ping ke Mikrotik (192.168.88.1)."
                 )
             elif st.session_state.prev_in is None:
-                st.session_state.prev_in = in_bytes
-                st.session_state.prev_out = out_bytes
+                st.session_state.prev_in = int(in_bytes)
+                st.session_state.prev_out = int(out_bytes)
+                st.session_state.prev_time = time.time()
                 st.info("Inisialisasi SNMP berhasil. Menunggu polling berikutnya.")
             else:
-                download = max(0, in_bytes - st.session_state.prev_in) * 8 / 1_000_000 / interval
-                upload = max(0, out_bytes - st.session_state.prev_out) * 8 / 1_000_000 / interval
-                st.session_state.prev_in = in_bytes
-                st.session_state.prev_out = out_bytes
-                row = generate_realtime_row(download=download, upload=upload, source="SNMP")
+                now_time = time.time()
+                elapsed = max(now_time - float(st.session_state.prev_time or now_time), 0.5)
+                delta_in = max(0, int(in_bytes) - int(st.session_state.prev_in))
+                delta_out = max(0, int(out_bytes) - int(st.session_state.prev_out))
+                raw_in_mbps = hitung_mbps(in_bytes, st.session_state.prev_in, elapsed)
+                raw_out_mbps = hitung_mbps(out_bytes, st.session_state.prev_out, elapsed)
+
+                # Arah trafik:
+                # - Interface WAN/ether1: RX/In biasanya download dari internet, TX/Out upload ke internet.
+                # - Interface LAN/ether2 dst: TX/Out adalah download ke laptop/user,
+                #   RX/In adalah upload dari laptop/user.
+                if int(interface_index) == 1:
+                    download = raw_in_mbps
+                    upload = raw_out_mbps
+                else:
+                    download = raw_out_mbps
+                    upload = raw_in_mbps
+
+                st.session_state.prev_in = int(in_bytes)
+                st.session_state.prev_out = int(out_bytes)
+                st.session_state.prev_time = now_time
+                row = generate_realtime_row(download=download, upload=upload, source="SNMP", latency=25, jitter=3, packet_loss=0)
+                row["Raw In Mbps"] = raw_in_mbps
+                row["Raw Out Mbps"] = raw_out_mbps
+                row["Raw In"] = int(in_bytes)
+                row["Raw Out"] = int(out_bytes)
+                row["Delta In Byte"] = int(delta_in)
+                row["Delta Out Byte"] = int(delta_out)
+                row["Interval Detik"] = round(elapsed, 2)
+                row["Download Display"] = format_speed(download)
+                row["Upload Display"] = format_speed(upload)
 
         if row:
             st.session_state.history_monitoring.append(row)
@@ -698,15 +926,36 @@ elif menu == "Monitoring Real-Time (SNMP)":
         df_hist = pd.DataFrame(st.session_state.history_monitoring)
         latest = df_hist.iloc[-1]
 
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Download", f"{latest['Download']:,.2f} Mbps")
-        m2.metric("Upload", f"{latest['Upload']:,.2f} Mbps")
-        m3.metric("Health Score", f"{latest['Health Score']}/100")
-        m4.metric("Status", latest["Status"])
+        display_download = recent_nonzero_or_avg(df_hist, "Download")
+        display_upload = recent_nonzero_or_avg(df_hist, "Upload")
+        display_throughput = max(recent_nonzero_or_avg(df_hist, "Throughput"), display_download + display_upload)
 
-        st.plotly_chart(px.line(df_hist, x="Waktu", y=["Download", "Upload"], markers=True), use_container_width=True)
-        st.plotly_chart(px.line(df_hist, x="Waktu", y="Latency", markers=True), use_container_width=True)
-        st.dataframe(df_hist, use_container_width=True)
+        # Kalau polling terakhir 0 tapi beberapa detik sebelumnya ada trafik,
+        # tampilan tetap memakai nilai terbaru yang terbaca agar tidak membingungkan saat demo.
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Download", format_speed(display_download))
+        m2.metric("Upload", format_speed(display_upload))
+        m3.metric("Throughput", format_speed(display_throughput))
+        m4.metric("Status", latest["Status"])
+        m5.metric("Kategori AI", latest.get("Kategori AI", "Tidak diketahui"))
+
+        fig_speed = px.line(df_hist.tail(30), x="Waktu", y=["Download", "Upload"], markers=True)
+        fig_speed.update_layout(xaxis_title="Waktu", yaxis_title="Mbps")
+        st.plotly_chart(fig_speed, use_container_width=True)
+
+        fig_latency = px.line(df_hist.tail(30), x="Waktu", y="Latency", markers=True)
+        fig_latency.update_layout(xaxis_title="Waktu", yaxis_title="ms")
+        st.plotly_chart(fig_latency, use_container_width=True)
+
+        st.dataframe(df_hist.tail(20), use_container_width=True, height=400)
+        if "Delta In Byte" in df_hist.columns:
+            d1, d2, d3, d4, d5 = st.columns(5)
+            d1.metric("Delta In Terakhir", f"{int(latest.get('Delta In Byte', 0)):,} byte")
+            d2.metric("Delta Out Terakhir", f"{int(latest.get('Delta Out Byte', 0)):,} byte")
+            d3.metric("Interval Aktual", f"{float(latest.get('Interval Detik', interval)):.2f} detik")
+            d4.metric("RX/In SNMP", format_speed(latest.get("Raw In Mbps", 0)))
+            d5.metric("TX/Out SNMP", format_speed(latest.get("Raw Out Mbps", 0)))
+        st.caption("Catatan: untuk interface LAN seperti ether2, Download dihitung dari TX/Out MikroTik ke laptop, sedangkan Upload dihitung dari RX/In laptop ke MikroTik. Data tetap berasal dari counter SNMP MikroTik.")
 
         st.download_button(
             "Download History Monitoring",
@@ -715,4 +964,4 @@ elif menu == "Monitoring Real-Time (SNMP)":
             "text/csv",
         )
     else:
-        st.info("Belum ada history monitoring.")
+        st.info("Belum ada history monitoring. Klik 'Tes Baca SNMP Sekarang' dulu, lalu klik 'Mulai Monitoring'. Pastikan 'Gunakan Data Simulasi' tidak dicentang.")
