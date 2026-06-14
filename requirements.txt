@@ -5,4 +5,5 @@ scikit-learn
 plotly
 matplotlib
 scipy
-pysnmp
+pysnmp==4.4.12
+pyasn1==0.4.8
