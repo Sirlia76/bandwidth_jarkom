@@ -12,11 +12,19 @@ from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 from sklearn.ensemble import IsolationForest
 
+import asyncio
+import inspect
+
+# SNMP memakai puresnmp karena di laptop kamu puresnmp sudah terinstall.
+# Kalau gagal, dashboard tetap bisa jalan dengan mode simulasi.
 try:
-    import puresnmp
+    from puresnmp import get as snmp_get
     SNMP_AVAILABLE = True
-except Exception:
+    SNMP_ERROR_MESSAGE = ""
+except Exception as e:
+    snmp_get = None
     SNMP_AVAILABLE = False
+    SNMP_ERROR_MESSAGE = str(e)
 
 # =========================================================
 # PAGE CONFIG
@@ -33,44 +41,115 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    .stApp {background: linear-gradient(135deg, #f7f9ff 0%, #ffffff 50%, #fff5fa 100%);} 
-    .block-container {padding-top: 1.2rem; padding-bottom: 3rem;}
-    .hero {
-        background: #ffffff;
-        border: 1px solid #ececf7;
-        padding: 28px 30px;
-        border-radius: 24px;
-        box-shadow: 0 10px 30px rgba(31, 41, 55, 0.08);
-        margin-bottom: 20px;
+    /* ===== Modern Blue Dashboard Theme ===== */
+    .stApp {
+        background:
+            radial-gradient(circle at top left, rgba(59,130,246,0.22), transparent 32%),
+            linear-gradient(135deg, #eaf3ff 0%, #f8fbff 48%, #dbeafe 100%);
+        color: #0f172a;
     }
+
+    .block-container {
+        padding-top: 1.2rem;
+        padding-bottom: 3rem;
+        max-width: 1280px;
+    }
+
+    .hero {
+        background: linear-gradient(135deg, #0f4c81 0%, #1d72d2 48%, #38bdf8 100%);
+        border: 1px solid rgba(255,255,255,0.35);
+        padding: 30px 32px;
+        border-radius: 26px;
+        box-shadow: 0 18px 45px rgba(30, 64, 175, 0.28);
+        margin-bottom: 22px;
+    }
+
     .main-title {
-        font-size: 48px;
+        font-size: 46px;
         font-weight: 900;
-        color: #111827;
+        color: #ffffff !important;
         margin: 0;
         line-height: 1.08;
         letter-spacing: -0.8px;
+        text-shadow: 0 2px 10px rgba(15,23,42,0.22);
     }
+
     .main-subtitle {
         font-size: 17px;
-        color: #4b5563;
-        margin-top: 10px;
+        color: #e0f2fe !important;
+        margin-top: 12px;
         margin-bottom: 0px;
+        line-height: 1.55;
     }
+
+    section[data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #0f4c81 0%, #1e3a8a 100%);
+        border-right: 1px solid rgba(255,255,255,0.14);
+    }
+
+    section[data-testid="stSidebar"] * {
+        color: #ffffff !important;
+    }
+
     div[data-testid="metric-container"] {
-        background: #ffffff;
-        border: 1px solid #ececf7;
-        padding: 16px;
+        background: rgba(255,255,255,0.96);
+        border: 1px solid rgba(37,99,235,0.20);
+        padding: 18px;
         border-radius: 20px;
-        box-shadow: 0 8px 24px rgba(17, 24, 39, 0.06);
+        box-shadow: 0 10px 28px rgba(30, 64, 175, 0.12);
     }
+
+    div[data-testid="metric-container"] label,
+    div[data-testid="metric-container"] [data-testid="stMetricLabel"] {
+        color: #1e3a8a !important;
+        font-weight: 800 !important;
+    }
+
+    div[data-testid="metric-container"] [data-testid="stMetricValue"] {
+        color: #0f172a !important;
+        font-weight: 900 !important;
+    }
+
+    h1, h2, h3, .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
+        color: #0f3b70 !important;
+        font-weight: 900 !important;
+    }
+
     .card {
-        background:#ffffff;
-        border:1px solid #ececf7;
-        border-radius:22px;
-        padding:18px 20px;
-        box-shadow: 0 8px 24px rgba(17, 24, 39, 0.06);
-        margin-bottom:14px;
+        background: rgba(255,255,255,0.96);
+        border: 1px solid rgba(37,99,235,0.20);
+        border-radius: 22px;
+        padding: 18px 20px;
+        box-shadow: 0 10px 28px rgba(30, 64, 175, 0.12);
+        margin-bottom: 14px;
+        color: #0f172a !important;
+        line-height: 1.6;
+        font-weight: 600;
+    }
+
+    .stButton>button {
+        background: linear-gradient(135deg, #1d4ed8, #0284c7);
+        color: white !important;
+        border: none;
+        border-radius: 14px;
+        padding: 0.62rem 1rem;
+        font-weight: 800;
+        box-shadow: 0 8px 20px rgba(37,99,235,0.25);
+    }
+
+    .stButton>button:hover {
+        filter: brightness(1.05);
+        transform: translateY(-1px);
+    }
+
+    div[data-testid="stDataFrame"], div[data-testid="stTable"] {
+        border-radius: 18px;
+        overflow: hidden;
+        border: 1px solid rgba(37,99,235,0.16);
+    }
+
+    .stAlert {
+        border-radius: 16px;
     }
     </style>
     """,
@@ -109,7 +188,6 @@ if missing_cols:
     st.error("Dataset wajib memiliki kolom: throughput, jitter, actual_bandwidth")
     st.stop()
 
-# Kolom tambahan agar dashboard tetap berjalan walaupun dataset sederhana
 if "rtt" not in data.columns:
     data["rtt"] = data.get("packet_delay", data["jitter"] * 2)
 if "packet_loss_ratio" not in data.columns:
@@ -280,15 +358,57 @@ def generate_realtime_row(download=None, upload=None, source="Simulasi"):
     }
 
 
-def get_snmp_octets(host, community, oid_in, oid_out, port):
-    if not SNMP_AVAILABLE:
-        return None, None
+def _normalize_snmp_value(result):
+    """Ubah hasil SNMP dari puresnmp menjadi integer."""
+    if hasattr(result, "value"):
+        result = result.value
+    if isinstance(result, bytes):
+        return int.from_bytes(result, byteorder="big", signed=False)
+    return int(result)
+
+
+def _run_async(coro):
+    """Jalankan coroutine puresnmp dengan aman di Streamlit."""
     try:
-        val_in = puresnmp.get(host, community, oid_in, port=int(port), timeout=3)
-        val_out = puresnmp.get(host, community, oid_out, port=int(port), timeout=3)
-        return int(val_in), int(val_out)
-    except Exception:
-        return None, None
+        return asyncio.run(coro)
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+
+def snmp_get_value(host, community, oid, port=161, timeout=2, retries=1):
+    """Ambil 1 nilai SNMP dari MikroTik menggunakan puresnmp."""
+    if not SNMP_AVAILABLE or snmp_get is None:
+        return None, f"Library puresnmp belum siap: {SNMP_ERROR_MESSAGE}"
+
+    try:
+        try:
+            result = snmp_get(host, community, oid, port=int(port), timeout=timeout)
+        except TypeError:
+            result = snmp_get(host, community, oid)
+
+        if inspect.isawaitable(result):
+            result = _run_async(result)
+
+        return _normalize_snmp_value(result), None
+    except Exception as e:
+        return None, str(e)
+
+
+def get_snmp_octets(host, community, oid_in, oid_out, port):
+    """Ambil total byte masuk dan keluar dari interface MikroTik."""
+    val_in, err_in = snmp_get_value(host, community, oid_in, port)
+    if err_in:
+        return None, None, err_in
+
+    val_out, err_out = snmp_get_value(host, community, oid_out, port)
+    if err_out:
+        return None, None, err_out
+
+    return val_in, val_out, None
 
 # =========================================================
 # SESSION STATE
@@ -305,7 +425,7 @@ if "polling_count" not in st.session_state:
     st.session_state.polling_count = 0
 
 # =========================================================
-# SIDEBAR - HANYA 5 FITUR SESUAI PERMINTAAN
+# SIDEBAR
 # =========================================================
 st.sidebar.markdown("### 📡 Menu Dashboard")
 menu = st.sidebar.radio(
@@ -321,7 +441,7 @@ menu = st.sidebar.radio(
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### Status Sistem")
-st.sidebar.write("SNMP:", "Tersedia" if SNMP_AVAILABLE else "Belum terinstall")
+st.sidebar.write("SNMP:", "Tersedia" if SNMP_AVAILABLE else f"Belum siap: {SNMP_ERROR_MESSAGE}")
 st.sidebar.write("Model:", "K-Means + Isolation Forest")
 
 if st.session_state.history_monitoring:
@@ -337,9 +457,9 @@ if menu == "Dashboard Utama":
     latest = df_dash.iloc[-1]
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Download", f"{df_dash['Download'].sum():,.0f}")
-    c2.metric("Total Upload", f"{df_dash['Upload'].sum():,.0f}")
-    c3.metric("Throughput", f"{latest['Throughput']:,.0f}")
+    c1.metric("Total Download", f"{df_dash['Download'].sum():,.0f} Mbps")
+    c2.metric("Total Upload", f"{df_dash['Upload'].sum():,.0f} Mbps")
+    c3.metric("Throughput", f"{latest['Throughput']:,.0f} Mbps")
     c4.metric("Health Score", f"{int(latest['Health Score'])}/100")
 
     c5, c6, c7, c8 = st.columns(4)
@@ -503,18 +623,25 @@ elif menu == "Monitoring Real-Time (SNMP)":
     st.subheader("Monitoring Bandwidth Real-Time via SNMP")
 
     if not SNMP_AVAILABLE:
-        st.info("Library `puresnmp` belum terinstall. Mode simulasi tetap bisa digunakan. Install dengan: `pip install puresnmp`")
+        st.info(f"Library `puresnmp` belum siap. Mode simulasi tetap bisa digunakan. Detail: {SNMP_ERROR_MESSAGE}. Install dengan: `pip install puresnmp`")
 
     with st.expander("Konfigurasi SNMP", expanded=True):
         col1, col2 = st.columns(2)
         with col1:
-            snmp_host = st.text_input("IP Perangkat", value="192.168.1.1")
+            snmp_host = st.text_input("IP Perangkat MikroTik", value="192.168.88.1")
             snmp_community = st.text_input("Community String", value="public")
             snmp_port = st.number_input("Port SNMP", value=161, min_value=1, max_value=65535)
         with col2:
-            oid_in = st.text_input("OID In (ifInOctets)", value="1.3.6.1.2.1.2.2.1.10.1")
-            oid_out = st.text_input("OID Out (ifOutOctets)", value="1.3.6.1.2.1.2.2.1.16.1")
+            interface_index = st.number_input("Nomor Interface yang Dipantau", value=2, min_value=1, max_value=50)
+            oid_in = st.text_input("OID In (ifInOctets)", value=f"1.3.6.1.2.1.2.2.1.10.{interface_index}")
+            oid_out = st.text_input("OID Out (ifOutOctets)", value=f"1.3.6.1.2.1.2.2.1.16.{interface_index}")
             interval = st.slider("Interval Polling (detik)", 2, 30, 5)
+
+        st.info(
+            "Catatan penting: SNMP dari Python membutuhkan IP MikroTik. "
+            "Kalau IP > Addresses di Winbox masih kosong, tambahkan IP MikroTik dulu atau minta izin dosen. "
+            "Community yang dipakai: public. Interface index 1 biasanya ether1, index 2 biasanya ether2."
+        )
 
     use_simulasi = st.checkbox("Gunakan Data Simulasi", value=not SNMP_AVAILABLE)
 
@@ -542,16 +669,20 @@ elif menu == "Monitoring Real-Time (SNMP)":
         if use_simulasi:
             row = generate_realtime_row(source="Simulasi")
         else:
-            in_bytes, out_bytes = get_snmp_octets(snmp_host, snmp_community, oid_in, oid_out, snmp_port)
-            if in_bytes is None or out_bytes is None:
-                st.error("Gagal mengambil data SNMP. Periksa IP, community string, OID, dan status SNMP perangkat.")
+            in_bytes, out_bytes, err = get_snmp_octets(snmp_host, snmp_community, oid_in, oid_out, snmp_port)
+            if err is not None:
+                st.error(
+                    f"Gagal mengambil data SNMP dari {snmp_host}:{snmp_port} ({err}). "
+                    "Periksa: SNMP aktif di Mikrotik (IP > SNMP), community string benar, "
+                    "OID sesuai nomor interface, dan komputer (192.168.88.2) bisa ping ke Mikrotik (192.168.88.1)."
+                )
             elif st.session_state.prev_in is None:
                 st.session_state.prev_in = in_bytes
                 st.session_state.prev_out = out_bytes
                 st.info("Inisialisasi SNMP berhasil. Menunggu polling berikutnya.")
             else:
-                download = max(0, in_bytes - st.session_state.prev_in) * 8 / 1000 / interval
-                upload = max(0, out_bytes - st.session_state.prev_out) * 8 / 1000 / interval
+                download = max(0, in_bytes - st.session_state.prev_in) * 8 / 1_000_000 / interval
+                upload = max(0, out_bytes - st.session_state.prev_out) * 8 / 1_000_000 / interval
                 st.session_state.prev_in = in_bytes
                 st.session_state.prev_out = out_bytes
                 row = generate_realtime_row(download=download, upload=upload, source="SNMP")
@@ -568,8 +699,8 @@ elif menu == "Monitoring Real-Time (SNMP)":
         latest = df_hist.iloc[-1]
 
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Download", f"{latest['Download']:,.2f}")
-        m2.metric("Upload", f"{latest['Upload']:,.2f}")
+        m1.metric("Download", f"{latest['Download']:,.2f} Mbps")
+        m2.metric("Upload", f"{latest['Upload']:,.2f} Mbps")
         m3.metric("Health Score", f"{latest['Health Score']}/100")
         m4.metric("Status", latest["Status"])
 
