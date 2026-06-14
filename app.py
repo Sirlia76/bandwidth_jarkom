@@ -12,24 +12,14 @@ from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 from sklearn.ensemble import IsolationForest
 
+
 # =========================================================
-# SNMP CONFIG - PAKAI PYSNMP, BUKAN PURESNMP
+# SNMP CONFIG
 # =========================================================
-try:
-    from pysnmp.hlapi import (
-        SnmpEngine,
-        CommunityData,
-        UdpTransportTarget,
-        ContextData,
-        ObjectType,
-        ObjectIdentity,
-        getCmd,
-    )
-    SNMP_AVAILABLE = True
-    SNMP_ERROR_MESSAGE = ""
-except Exception as e:
-    SNMP_AVAILABLE = False
-    SNMP_ERROR_MESSAGE = str(e)
+# SNMP tidak di-import di awal supaya dashboard tetap bisa jalan
+# walaupun library SNMP bermasalah di Streamlit Cloud.
+SNMP_AVAILABLE = True
+SNMP_ERROR_MESSAGE = ""
 
 
 # =========================================================
@@ -246,10 +236,13 @@ data["Kategori_Bandwidth"] = data["Cluster"].map(label_cluster)
 # =========================================================
 def format_speed(mbps):
     mbps = float(mbps)
+
     if mbps >= 1:
         return f"{mbps:,.2f} Mbps"
+
     if mbps >= 0.001:
         return f"{mbps * 1000:,.2f} Kbps"
+
     return f"{mbps * 1_000_000:,.0f} bps"
 
 
@@ -282,14 +275,17 @@ def health_score(latency, jitter, packet_loss, usage_ratio):
     nilai -= min(jitter / 4.0, 15)
     nilai -= min(packet_loss * 5.0, 20)
     nilai -= min(usage_ratio * 15.0, 15)
+
     return int(max(0, min(100, nilai)))
 
 
 def network_status(score_val, usage_ratio):
     if score_val >= 75 and usage_ratio < 0.70:
         return "Stabil"
+
     if score_val >= 45:
         return "Padat"
+
     return "Overload"
 
 
@@ -302,10 +298,13 @@ def network_mood(latency, jitter, packet_loss, usage_ratio):
 
     if buruk == 0:
         return "Calm"
+
     if buruk == 1:
         return "Busy"
+
     if buruk == 2:
         return "Chaotic"
+
     return "Frustrated"
 
 
@@ -412,14 +411,30 @@ def historical_dashboard_data(n=100):
     )
 
     df["Health Score"] = df.apply(
-        lambda r: health_score(r["Latency"], r["Jitter"], r["Packet Loss"], r["Usage"] / 100),
+        lambda r: health_score(
+            r["Latency"],
+            r["Jitter"],
+            r["Packet Loss"],
+            r["Usage"] / 100,
+        ),
         axis=1,
     )
 
-    df["Status"] = df.apply(lambda r: network_status(r["Health Score"], r["Usage"] / 100), axis=1)
+    df["Status"] = df.apply(
+        lambda r: network_status(
+            r["Health Score"],
+            r["Usage"] / 100,
+        ),
+        axis=1,
+    )
 
     df["Mood"] = df.apply(
-        lambda r: network_mood(r["Latency"], r["Jitter"], r["Packet Loss"], r["Usage"] / 100),
+        lambda r: network_mood(
+            r["Latency"],
+            r["Jitter"],
+            r["Packet Loss"],
+            r["Usage"] / 100,
+        ),
         axis=1,
     )
 
@@ -451,6 +466,7 @@ def generate_realtime_row(download=None, upload=None, source="Simulasi", latency
     else:
         download = float(download or 0.0)
         upload = float(upload or 0.0)
+
         throughput_now = download + upload
 
         latency = float(latency if latency is not None else 25 + min(throughput_now * 1.8, 60))
@@ -458,7 +474,14 @@ def generate_realtime_row(download=None, upload=None, source="Simulasi", latency
         packet_loss = float(packet_loss if packet_loss is not None else min(max(throughput_now - 10, 0) * 0.04, 2.0))
 
     usage_ratio = min(1.0, (download + upload) / (max_bw * 1.3))
-    activity = classify_activity(download / max_bw, upload / max_bw, latency, jitter, packet_loss)
+
+    activity = classify_activity(
+        download / max_bw,
+        upload / max_bw,
+        latency,
+        jitter,
+        packet_loss,
+    )
 
     if source != "Simulasi":
         throughput_now = float(download + upload)
@@ -487,6 +510,7 @@ def generate_realtime_row(download=None, upload=None, source="Simulasi", latency
             [[throughput_now, float(jitter), float(download)]],
             columns=fitur,
         )
+
         cluster_ai = kmeans.predict(scaler.transform(sample_ai))[0]
         kategori_ai = label_cluster.get(cluster_ai, "Tidak diketahui")
     except Exception:
@@ -518,9 +542,10 @@ def generate_realtime_row(download=None, upload=None, source="Simulasi", latency
 
 
 # =========================================================
-# SNMP FUNCTIONS - PYSNMP
+# SNMP FUNCTIONS
 # =========================================================
 def _normalize_snmp_value(value):
+    """Ubah hasil SNMP menjadi integer."""
     try:
         return int(value)
     except Exception:
@@ -528,41 +553,77 @@ def _normalize_snmp_value(value):
 
 
 def snmp_get_value(host, community, oid, port=161, timeout=2, retries=1):
-    if not SNMP_AVAILABLE:
-        return None, f"Library pysnmp belum siap: {SNMP_ERROR_MESSAGE}"
+    """
+    Ambil 1 nilai SNMP dari MikroTik.
+
+    Library pysnmp di-import di dalam fungsi agar dashboard tetap berjalan
+    walaupun fitur SNMP tidak berhasil dipakai di Streamlit Cloud.
+    """
+    try:
+        import asyncio
+        from pysnmp.hlapi.asyncio import (
+            SnmpEngine,
+            CommunityData,
+            UdpTransportTarget,
+            ContextData,
+            ObjectType,
+            ObjectIdentity,
+            get_cmd,
+        )
+    except Exception as e:
+        return None, f"Library pysnmp belum siap: {e}"
+
+    async def _get():
+        try:
+            target = await UdpTransportTarget.create(
+                (host, int(port)),
+                timeout=timeout,
+                retries=retries,
+            )
+
+            result = await get_cmd(
+                SnmpEngine(),
+                CommunityData(community, mpModel=1),
+                target,
+                ContextData(),
+                ObjectType(ObjectIdentity(oid)),
+            )
+
+            error_indication, error_status, error_index, var_binds = result
+
+            if error_indication:
+                return None, str(error_indication)
+
+            if error_status:
+                return None, str(error_status.prettyPrint())
+
+            for _, value in var_binds:
+                return _normalize_snmp_value(value), None
+
+            return None, "Tidak ada data SNMP yang dikembalikan."
+
+        except Exception as e:
+            return None, str(e)
 
     try:
-        iterator = getCmd(
-            SnmpEngine(),
-            CommunityData(community, mpModel=1),
-            UdpTransportTarget((host, int(port)), timeout=timeout, retries=retries),
-            ContextData(),
-            ObjectType(ObjectIdentity(oid)),
-        )
-
-        error_indication, error_status, error_index, var_binds = next(iterator)
-
-        if error_indication:
-            return None, str(error_indication)
-
-        if error_status:
-            return None, str(error_status.prettyPrint())
-
-        for _, value in var_binds:
-            return _normalize_snmp_value(value), None
-
-        return None, "Tidak ada data SNMP yang dikembalikan."
-
-    except Exception as e:
-        return None, str(e)
+        return asyncio.run(_get())
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(_get())
+        finally:
+            loop.close()
 
 
 def get_snmp_octets(host, community, oid_in, oid_out, port):
+    """Ambil total byte masuk dan keluar dari interface MikroTik."""
     val_in, err_in = snmp_get_value(host, community, oid_in, port)
+
     if err_in:
         return None, None, err_in
 
     val_out, err_out = snmp_get_value(host, community, oid_out, port)
+
     if err_out:
         return None, None, err_out
 
@@ -570,14 +631,20 @@ def get_snmp_octets(host, community, oid_in, oid_out, port):
 
 
 def hitung_mbps(byte_now, byte_prev, interval_detik):
+    """Hitung Mbps dari selisih byte SNMP."""
     if byte_now is None or byte_prev is None:
         return 0.0
 
     delta = max(0, int(byte_now) - int(byte_prev))
+
     return (delta * 8) / max(float(interval_detik), 1.0) / 1_000_000
 
 
 def recent_nonzero_or_avg(df, col, window=6):
+    """
+    Ambil nilai terbaru yang tidak nol.
+    Kalau semua nol, pakai rata-rata window.
+    """
     if df is None or df.empty or col not in df.columns:
         return 0.0
 
@@ -630,12 +697,8 @@ menu = st.sidebar.radio(
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### Status Sistem")
-
-if SNMP_AVAILABLE:
-    st.sidebar.success("SNMP: Library tersedia")
-else:
-    st.sidebar.error(f"SNMP: Belum siap: {SNMP_ERROR_MESSAGE}")
-
+st.sidebar.success("SNMP: Mode siap diuji")
+st.sidebar.caption("Tes koneksi SNMP ada di menu Monitoring Real-Time.")
 st.sidebar.write("Model: K-Means + Isolation Forest")
 
 if st.session_state.history_monitoring:
@@ -722,6 +785,7 @@ if menu == "Dashboard Utama":
                 y=["Bandwidth Usage"],
             )
         )
+
         fig_heat.update_layout(title="Heatmap Jam Sibuk")
         st.plotly_chart(fig_heat, use_container_width=True)
 
@@ -770,7 +834,12 @@ elif menu == "Dataset Training":
 
     st.markdown("### Visualisasi Clustering")
     st.plotly_chart(
-        px.scatter(data, x="throughput", y="actual_bandwidth", color="Kategori_Bandwidth"),
+        px.scatter(
+            data,
+            x="throughput",
+            y="actual_bandwidth",
+            color="Kategori_Bandwidth",
+        ),
         use_container_width=True,
     )
 
@@ -804,7 +873,14 @@ elif menu == "Input Manual":
         max_bw = max(data["actual_bandwidth"].quantile(0.95), 1)
         usage_ratio = min(1.0, (actual_bandwidth + upload) / (max_bw * 1.3))
 
-        activity = classify_activity(actual_bandwidth / max_bw, upload / max_bw, latency, jitter, packet_loss)
+        activity = classify_activity(
+            actual_bandwidth / max_bw,
+            upload / max_bw,
+            latency,
+            jitter,
+            packet_loss,
+        )
+
         hscore = health_score(latency, jitter, packet_loss, usage_ratio)
         status = network_status(hscore, usage_ratio)
         mood = network_mood(latency, jitter, packet_loss, usage_ratio)
@@ -890,6 +966,7 @@ elif menu == "Upload Dataset Baru":
                 "hasil_analisis_dataset_baru.csv",
                 "text/csv",
             )
+
         else:
             st.error("File CSV harus memiliki kolom: throughput, jitter, actual_bandwidth")
 
@@ -900,15 +977,10 @@ elif menu == "Upload Dataset Baru":
 elif menu == "Monitoring Real-Time (SNMP)":
     st.subheader("Monitoring Bandwidth Real-Time via SNMP")
 
-    if not SNMP_AVAILABLE:
-        st.warning(
-            f"Library `pysnmp` belum siap. Mode simulasi tetap bisa digunakan. "
-            f"Detail: {SNMP_ERROR_MESSAGE}. Pastikan `pysnmp` ada di requirements.txt."
-        )
-
     st.info(
-        "Catatan: Jika aplikasi dibuka dari Streamlit Cloud, IP lokal MikroTik seperti 192.168.88.1 biasanya tidak bisa diakses. "
-        "Untuk SNMP real-time asli, jalankan aplikasi secara lokal di laptop yang satu jaringan dengan MikroTik."
+        "SNMP akan diuji saat tombol `Tes Baca SNMP Sekarang` ditekan. "
+        "Kalau pakai MikroTik lokal dengan IP seperti 192.168.88.1, sebaiknya jalankan aplikasi dari laptop "
+        "yang satu jaringan dengan MikroTik. Link Streamlit Cloud biasanya tidak bisa membaca IP lokal router."
     )
 
     with st.expander("Konfigurasi SNMP", expanded=True):
@@ -921,20 +993,37 @@ elif menu == "Monitoring Real-Time (SNMP)":
 
         with col2:
             interface_index = st.number_input("Nomor Interface yang Dipantau", value=2, min_value=1, max_value=50)
-            oid_in = st.text_input("OID In / RX / ifInOctets", value=f"1.3.6.1.2.1.2.2.1.10.{interface_index}")
-            oid_out = st.text_input("OID Out / TX / ifOutOctets", value=f"1.3.6.1.2.1.2.2.1.16.{interface_index}")
+            oid_in = st.text_input(
+                "OID In / RX / ifInOctets",
+                value=f"1.3.6.1.2.1.2.2.1.10.{interface_index}",
+            )
+            oid_out = st.text_input(
+                "OID Out / TX / ifOutOctets",
+                value=f"1.3.6.1.2.1.2.2.1.16.{interface_index}",
+            )
             interval = st.slider("Interval Polling (detik)", 2, 30, 5)
 
         st.caption(
             "Interface index 1 biasanya ether1/WAN, index 2 biasanya ether2/LAN. "
-            "Untuk MikroTik, aktifkan SNMP di menu IP > SNMP dan gunakan community sesuai konfigurasi."
+            "Di MikroTik, aktifkan SNMP lewat IP > SNMP, lalu pastikan community sesuai."
         )
 
         if st.button("🔎 Tes Baca SNMP Sekarang"):
-            if not SNMP_AVAILABLE:
-                st.error(f"SNMP belum bisa digunakan: {SNMP_ERROR_MESSAGE}")
+            test_in_1, test_out_1, test_err_1 = get_snmp_octets(
+                snmp_host,
+                snmp_community,
+                oid_in,
+                oid_out,
+                snmp_port,
+            )
+
+            if test_err_1:
+                st.error(f"SNMP masih gagal: {test_err_1}")
             else:
-                test_in_1, test_out_1, test_err_1 = get_snmp_octets(
+                with st.spinner("SNMP berhasil membaca counter awal. Mengukur selisih 3 detik..."):
+                    time.sleep(3)
+
+                test_in_2, test_out_2, test_err_2 = get_snmp_octets(
                     snmp_host,
                     snmp_community,
                     oid_in,
@@ -942,38 +1031,24 @@ elif menu == "Monitoring Real-Time (SNMP)":
                     snmp_port,
                 )
 
-                if test_err_1:
-                    st.error(f"SNMP masih gagal: {test_err_1}")
+                if test_err_2:
+                    st.error(f"SNMP counter awal terbaca, tapi counter kedua gagal: {test_err_2}")
                 else:
-                    with st.spinner("SNMP berhasil membaca counter awal. Mengukur selisih 3 detik..."):
-                        time.sleep(3)
+                    test_download = hitung_mbps(test_in_2, test_in_1, 3)
+                    test_upload = hitung_mbps(test_out_2, test_out_1, 3)
 
-                    test_in_2, test_out_2, test_err_2 = get_snmp_octets(
-                        snmp_host,
-                        snmp_community,
-                        oid_in,
-                        oid_out,
-                        snmp_port,
+                    st.success("SNMP berhasil membaca counter MikroTik dan menghitung trafik.")
+
+                    t1, t2, t3, t4 = st.columns(4)
+                    t1.metric("Raw In Awal", f"{test_in_1:,}")
+                    t2.metric("Raw In Akhir", f"{test_in_2:,}")
+                    t3.metric("Download Terukur", format_speed(test_download))
+                    t4.metric("Upload Terukur", format_speed(test_upload))
+
+                    st.caption(
+                        "Kalau speed kecil, itu normal saat trafik ringan. "
+                        "Coba buka YouTube/download kecil agar counter berubah."
                     )
-
-                    if test_err_2:
-                        st.error(f"SNMP counter awal terbaca, tapi counter kedua gagal: {test_err_2}")
-                    else:
-                        test_download = hitung_mbps(test_in_2, test_in_1, 3)
-                        test_upload = hitung_mbps(test_out_2, test_out_1, 3)
-
-                        st.success("SNMP berhasil membaca counter MikroTik dan menghitung trafik.")
-
-                        t1, t2, t3, t4 = st.columns(4)
-                        t1.metric("Raw In Awal", f"{test_in_1:,}")
-                        t2.metric("Raw In Akhir", f"{test_in_2:,}")
-                        t3.metric("Download Terukur", format_speed(test_download))
-                        t4.metric("Upload Terukur", format_speed(test_upload))
-
-                        st.caption(
-                            "Kalau speed kecil, itu normal saat trafik ringan. "
-                            "Coba buka YouTube/download kecil agar counter berubah."
-                        )
 
     use_simulasi = st.checkbox("Gunakan Data Simulasi", value=False)
 
@@ -1007,67 +1082,67 @@ elif menu == "Monitoring Real-Time (SNMP)":
 
         if use_simulasi:
             row = generate_realtime_row(source="Simulasi")
+
         else:
-            if not SNMP_AVAILABLE:
-                st.error("SNMP belum tersedia. Centang `Gunakan Data Simulasi` atau perbaiki requirements.txt.")
-            else:
-                in_bytes, out_bytes, err = get_snmp_octets(
-                    snmp_host,
-                    snmp_community,
-                    oid_in,
-                    oid_out,
-                    snmp_port,
+            in_bytes, out_bytes, err = get_snmp_octets(
+                snmp_host,
+                snmp_community,
+                oid_in,
+                oid_out,
+                snmp_port,
+            )
+
+            if err is not None:
+                st.error(
+                    f"Gagal mengambil data SNMP dari {snmp_host}:{snmp_port}. Detail: {err}. "
+                    "Periksa IP MikroTik, community string, OID interface, SNMP di MikroTik, dan koneksi jaringan."
                 )
 
-                if err is not None:
-                    st.error(
-                        f"Gagal mengambil data SNMP dari {snmp_host}:{snmp_port}. Detail: {err}. "
-                        "Periksa IP MikroTik, community string, OID interface, SNMP di MikroTik, dan koneksi jaringan."
-                    )
-                elif st.session_state.prev_in is None:
-                    st.session_state.prev_in = int(in_bytes)
-                    st.session_state.prev_out = int(out_bytes)
-                    st.session_state.prev_time = time.time()
-                    st.info("Inisialisasi SNMP berhasil. Menunggu polling berikutnya.")
+            elif st.session_state.prev_in is None:
+                st.session_state.prev_in = int(in_bytes)
+                st.session_state.prev_out = int(out_bytes)
+                st.session_state.prev_time = time.time()
+                st.info("Inisialisasi SNMP berhasil. Menunggu polling berikutnya.")
+
+            else:
+                now_time = time.time()
+                elapsed = max(now_time - float(st.session_state.prev_time or now_time), 0.5)
+
+                delta_in = max(0, int(in_bytes) - int(st.session_state.prev_in))
+                delta_out = max(0, int(out_bytes) - int(st.session_state.prev_out))
+
+                raw_in_mbps = hitung_mbps(in_bytes, st.session_state.prev_in, elapsed)
+                raw_out_mbps = hitung_mbps(out_bytes, st.session_state.prev_out, elapsed)
+
+                if int(interface_index) == 1:
+                    download = raw_in_mbps
+                    upload = raw_out_mbps
                 else:
-                    now_time = time.time()
-                    elapsed = max(now_time - float(st.session_state.prev_time or now_time), 0.5)
+                    download = raw_out_mbps
+                    upload = raw_in_mbps
 
-                    delta_in = max(0, int(in_bytes) - int(st.session_state.prev_in))
-                    delta_out = max(0, int(out_bytes) - int(st.session_state.prev_out))
+                st.session_state.prev_in = int(in_bytes)
+                st.session_state.prev_out = int(out_bytes)
+                st.session_state.prev_time = now_time
 
-                    raw_in_mbps = hitung_mbps(in_bytes, st.session_state.prev_in, elapsed)
-                    raw_out_mbps = hitung_mbps(out_bytes, st.session_state.prev_out, elapsed)
+                row = generate_realtime_row(
+                    download=download,
+                    upload=upload,
+                    source="SNMP",
+                    latency=25,
+                    jitter=3,
+                    packet_loss=0,
+                )
 
-                    if int(interface_index) == 1:
-                        download = raw_in_mbps
-                        upload = raw_out_mbps
-                    else:
-                        download = raw_out_mbps
-                        upload = raw_in_mbps
-
-                    st.session_state.prev_in = int(in_bytes)
-                    st.session_state.prev_out = int(out_bytes)
-                    st.session_state.prev_time = now_time
-
-                    row = generate_realtime_row(
-                        download=download,
-                        upload=upload,
-                        source="SNMP",
-                        latency=25,
-                        jitter=3,
-                        packet_loss=0,
-                    )
-
-                    row["Raw In Mbps"] = raw_in_mbps
-                    row["Raw Out Mbps"] = raw_out_mbps
-                    row["Raw In"] = int(in_bytes)
-                    row["Raw Out"] = int(out_bytes)
-                    row["Delta In Byte"] = int(delta_in)
-                    row["Delta Out Byte"] = int(delta_out)
-                    row["Interval Detik"] = round(elapsed, 2)
-                    row["Download Display"] = format_speed(download)
-                    row["Upload Display"] = format_speed(upload)
+                row["Raw In Mbps"] = raw_in_mbps
+                row["Raw Out Mbps"] = raw_out_mbps
+                row["Raw In"] = int(in_bytes)
+                row["Raw Out"] = int(out_bytes)
+                row["Delta In Byte"] = int(delta_in)
+                row["Delta Out Byte"] = int(delta_out)
+                row["Interval Detik"] = round(elapsed, 2)
+                row["Download Display"] = format_speed(download)
+                row["Upload Display"] = format_speed(upload)
 
         if row:
             st.session_state.history_monitoring.append(row)
@@ -1126,6 +1201,7 @@ elif menu == "Monitoring Real-Time (SNMP)":
             "history_monitoring.csv",
             "text/csv",
         )
+
     else:
         st.info(
             "Belum ada history monitoring. Klik `Tes Baca SNMP Sekarang` dulu, lalu klik `Mulai Monitoring`. "
